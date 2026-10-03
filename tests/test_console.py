@@ -8,6 +8,17 @@ from psdline.console.router import Router
 from psdline.console.server import ConsoleServer, probe_endpoints
 
 
+def _creds(platform, name="admin"):
+    key = next(spec.key for spec in platform.config.security.principals if spec.name == name)
+    return {"token": key, "confirm": ""}
+
+
+def _confirm(api, creds, action, target):
+    status, payload = api.handle("POST", "/api/confirm", {}, {"action": action, "target": target}, creds)
+    assert status == 200, payload
+    return {**creds, "confirm": payload["ticket"]}
+
+
 def test_router_prefers_exact_path():
     router = Router()
     router.add("GET", "/api/trains/{trainID}", lambda params, body: {"param": params["trainID"]})
@@ -23,7 +34,7 @@ def test_router_prefers_exact_path():
 
 def test_api_returns_status_and_routes(platform):
     api = Api(platform)
-    status, payload = api.handle("GET", "/api/status", {}, {})
+    status, payload = api.handle("GET", "/api/status", {}, {}, _creds(platform))
     assert status == 200
     assert payload["platform"] == platform.config.name
     paths = [route["path"] for route in api.routes()]
@@ -33,87 +44,92 @@ def test_api_returns_status_and_routes(platform):
 
 def test_api_unknown_path_is_404(platform):
     api = Api(platform)
-    status, payload = api.handle("GET", "/api/does-not-exist", {}, {})
+    status, payload = api.handle("GET", "/api/does-not-exist", {}, {}, _creds(platform))
     assert status == 404
     assert payload["error"] == "not_found"
 
 
 def test_api_station_and_train_views(platform):
     api = Api(platform)
-    status, view = api.handle("GET", "/api/stations/ST1", {}, {})
+    status, view = api.handle("GET", "/api/stations/ST1", {}, {}, _creds(platform))
     assert status == 200
     assert view["station"]["id"] == "ST1"
-    status, missing = api.handle("GET", "/api/trains/T99", {}, {})
+    status, missing = api.handle("GET", "/api/trains/T99", {}, {}, _creds(platform))
     assert status == 400
     assert missing["component"] == "console"
     platform.arrive("T01", "ST1", 0)
-    status, train = api.handle("GET", "/api/trains/T01", {}, {})
+    status, train = api.handle("GET", "/api/trains/T01", {}, {}, _creds(platform))
     assert status == 200
     assert train["aspect"] == "yellow"
 
 
 def test_api_mapping_and_resolve(platform):
     api = Api(platform)
-    status, mapping = api.handle("GET", "/api/mapping/ST1", {}, {})
+    status, mapping = api.handle("GET", "/api/mapping/ST1", {}, {}, _creds(platform))
     assert status == 200
     assert mapping["groups"]["G01"] == "G01"
-    status, resolved = api.handle("GET", "/api/resolve", {"station_id": "ST1", "group_key": "G02"}, {})
+    status, resolved = api.handle("GET", "/api/resolve", {"station_id": "ST1", "group_key": "G02"}, {}, _creds(platform))
     assert status == 200
     assert resolved["group"] == "G02"
-    status, broken = api.handle("GET", "/api/resolve", {"station_id": "ST1", "group_key": "NOPE"}, {})
+    status, broken = api.handle("GET", "/api/resolve", {"station_id": "ST1", "group_key": "NOPE"}, {}, _creds(platform))
     assert status == 409
 
 
 def test_api_action_flow(platform):
     api = Api(platform)
+    creds = _creds(platform)
     status, arrival = api.handle(
-        "POST", "/api/arrive", {}, {"train_id": "T01", "station_id": "ST1", "position_m": 0}
+        "POST", "/api/arrive", {}, {"train_id": "T01", "station_id": "ST1", "position_m": 0}, creds
     )
     assert status == 200 and arrival["ok"] is True
-    status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"})
+    status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"}, creds)
     assert status == 200 and gap["clear"] is True
     status, queued = api.handle(
-        "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
+        "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}, creds
     )
     assert status == 200
-    status, processed = api.handle("POST", "/api/process", {}, {"train_id": "T01"})
+    status, processed = api.handle("POST", "/api/process", {}, {"train_id": "T01"}, creds)
     assert status == 200 and processed["ids"] == ["c1"] and processed["ready"] is False
     status, departure = api.handle(
-        "POST", "/api/depart", {}, {"train_id": "T01", "station_id": "ST1"}
+        "POST", "/api/depart", {}, {"train_id": "T01", "station_id": "ST1"}, creds
     )
     assert status == 200 and departure["ok"] is True
 
 
 def test_api_rejects_missing_and_bad_fields(platform):
     api = Api(platform)
-    status, payload = api.handle("POST", "/api/arrive", {}, {"station_id": "ST1"})
+    creds = _creds(platform)
+    status, payload = api.handle("POST", "/api/arrive", {}, {"station_id": "ST1"}, creds)
     assert status == 400
     assert payload["component"] == "console"
-    status, payload = api.handle("POST", "/api/cycle", {}, {"dt": "abc"})
+    status, payload = api.handle("POST", "/api/cycle", {}, {"dt": "abc"}, creds)
     assert status == 400
     assert payload["error"] == "RailError"
-    status, payload = api.handle("POST", "/api/renumber", {}, {"station_id": "ST1"})
+    confirmed = _confirm(api, creds, "/api/renumber", "ST1")
+    status, payload = api.handle("POST", "/api/renumber", {}, {"station_id": "ST1"}, confirmed)
     assert status == 400
+    confirmed = _confirm(api, creds, "/api/renumber", "ST1")
     status, payload = api.handle(
-        "POST", "/api/renumber", {}, {"station_id": "ST1", "groups": {"A": "G01"}}
+        "POST", "/api/renumber", {}, {"station_id": "ST1", "groups": {"A": "G01"}}, confirmed
     )
     assert status == 200
 
 
 def test_api_readiness_and_queries(platform):
     api = Api(platform)
+    creds = _creds(platform)
     platform.arrive("T01", "ST1", 0)
-    status, ready = api.handle("GET", "/api/readiness", {}, {})
+    status, ready = api.handle("GET", "/api/readiness", {}, {}, creds)
     assert status == 200 and ready["ready"] is True
-    status, audit = api.handle("GET", "/api/audit", {"limit": "10"}, {})
+    status, audit = api.handle("GET", "/api/audit", {"limit": "10"}, {}, creds)
     assert status == 200 and audit["entries"]
-    status, timeline = api.handle("GET", "/api/timeline", {"train_id": "T01"}, {})
+    status, timeline = api.handle("GET", "/api/timeline", {"train_id": "T01"}, {}, creds)
     assert status == 200 and timeline["timeline"][0]["kind"] == "arrival"
-    status, store = api.handle("GET", "/api/store", {}, {})
+    status, store = api.handle("GET", "/api/store", {}, {}, creds)
     assert status == 200 and "quota/arrival" in store["documents"]
-    status, namespace = api.handle("GET", "/api/namespace", {}, {})
+    status, namespace = api.handle("GET", "/api/namespace", {}, {}, creds)
     assert status == 200 and namespace["line"] == "L1"
-    status, gate = api.handle("GET", "/api/doors/ST1-G01-01", {}, {})
+    status, gate = api.handle("GET", "/api/doors/ST1-G01-01", {}, {}, creds)
     assert status == 200 and gate["gate"]["station"] == "ST1"
 
 
@@ -135,6 +151,7 @@ def test_server_serves_api_and_pages(platform):
         probe = probe_endpoints(
             base_url,
             ["/api/status", "/api/readiness", "/api/stations", "/", "/trains", "/api/nope"],
+            token=platform.config.security.first_admin_key(),
         )
     finally:
         server.stop()

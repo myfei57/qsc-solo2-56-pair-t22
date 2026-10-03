@@ -50,5 +50,17 @@
   "console": {
     "host": "127.0.0.1",
     "port": 8080
+  },
+  "security": {
+    "session_ttl_s": 900,
+    "confirm_ttl_s": 30,
+    "cross_partition_read": true,
+    "principals": [
+      {"name": "dispatch-admin", "role": "admin", "key": "change-me-admin", "partitions": ["*"]},
+      {"name": "operator-st1", "role": "operator", "key": "change-me-st1", "partitions": ["ST1"]},
+      {"name": "operator-st2", "role": "operator", "key": "change-me-st2", "partitions": ["ST2"]},
+      {"name": "operator-st3", "role": "operator", "key": "change-me-st3", "partitions": ["ST3"]},
+      {"name": "viewer", "role": "viewer", "key": "change-me-viewer", "partitions": []}
+    ]
   }
 }

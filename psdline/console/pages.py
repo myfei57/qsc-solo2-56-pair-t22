@@ -10,6 +10,7 @@ from __future__ import annotations
 from html import escape
 
 from ..app import Platform
+from ..security import Principal
 
 PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms")
 
@@ -43,19 +44,51 @@ def _table(title: str, rows: list[tuple[str, object]]) -> str:
     return f"<h2>{escape(title)}</h2><table>{body}</table>"
 
 
-def _shell(title: str, body: str) -> str:
-    """套上页头与导航。"""
+def _shell(title: str, body: str, identity: str = "") -> str:
+    """套上页头与导航；``identity`` 非空时在页头展示当前登录主体。"""
 
     nav = "".join(f'<a href="{path}">{label}</a>' for path, label in _NAV)
+    who = ""
+    if identity:
+        who = (
+            f'<span style="float:right">{escape(identity)} '
+            '<a href="#" onclick="fetch(\'/api/session/close\',{method:\'POST\'})'
+            '.then(()=>location.reload());return false">退出</a></span>'
+        )
     return (
         '<!doctype html><html lang="zh"><head><meta charset="utf-8">'
         f"<title>{escape(title)}</title><style>{_STYLE}</style></head>"
-        f'<body><header><strong>{escape(title)}</strong><nav style="margin-top:8px">{nav}</nav>'
+        f'<body><header><strong>{escape(title)}</strong>{who}'
+        f'<nav style="margin-top:8px">{nav}</nav>'
         f"</header><main>{body}</main></body></html>"
     )
 
 
-def _station_page(platform: Platform) -> str:
+def login_page() -> str:
+    """登录页：提交密钥换会话，浏览器凭 HttpOnly Cookie 访问页面。"""
+
+    body = """
+<h2>控制台登录</h2>
+<p>请输入访问密钥。会话有时效；危险动作还需要单独的一次性确认凭据。</p>
+<p><input id="key" type="password" placeholder="访问密钥" autocomplete="off">
+<button onclick="login()">登录</button></p>
+<p id="msg" class="alarm"></p>
+<script>
+async function login() {
+  const resp = await fetch('/api/session', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: document.getElementById('key').value})
+  });
+  if (resp.ok) { location.reload(); }
+  else { document.getElementById('msg').textContent = '登录失败：密钥无效或会话已过期'; }
+}
+</script>
+"""
+    return _shell("控制台登录", body)
+
+
+def _station_page(platform: Platform, identity: str = "") -> str:
     """站台页：门区、布局与映射修订。"""
 
     status = platform.status()
@@ -80,10 +113,10 @@ def _station_page(platform: Platform) -> str:
         [(item["station"]["id"], f"修订 {item['revision']} 跨度 {item['span_m']} m") for item in views]
         or [("暂无", "-")],
     )
-    return _shell("站台控制台", body)
+    return _shell("站台控制台", body, identity)
 
 
-def _train_page(platform: Platform) -> str:
+def _train_page(platform: Platform, identity: str = "") -> str:
     """列车页：到发、对位与灯位。"""
 
     status = platform.status()
@@ -122,10 +155,10 @@ def _train_page(platform: Platform) -> str:
         ]
         or [("暂无", "-")],
     )
-    return _shell("列车控制台", body)
+    return _shell("列车控制台", body, identity)
 
 
-def _door_page(platform: Platform) -> str:
+def _door_page(platform: Platform, identity: str = "") -> str:
     """门控页：开闭、锁定与批量上限。"""
 
     status = platform.status()
@@ -159,10 +192,10 @@ def _door_page(platform: Platform) -> str:
         ]
         or [("暂无", "-")],
     )
-    return _shell("门控控制台", body)
+    return _shell("门控控制台", body, identity)
 
 
-def _alarm_page(platform: Platform) -> str:
+def _alarm_page(platform: Platform, identity: str = "") -> str:
     """告警页：故障、锁定比例与审计时间线。"""
 
     status = platform.status()
@@ -193,7 +226,7 @@ def _alarm_page(platform: Platform) -> str:
         [(f"{item['step']}. {item['kind']}", f"{item['train_id']} {item['station_id']}") for item in timeline]
         or [("暂无", "-")],
     )
-    return _shell("告警控制台", body)
+    return _shell("告警控制台", body, identity)
 
 
 _RENDERERS = {
@@ -204,10 +237,11 @@ _RENDERERS = {
 }
 
 
-def render_page(path: str, platform: Platform) -> str | None:
+def render_page(path: str, platform: Platform, principal: Principal | None = None) -> str | None:
     """渲染一个页面；路径不是页面时返回 ``None``。"""
 
     renderer = _RENDERERS.get(path)
     if renderer is None:
         return None
-    return renderer(platform)
+    identity = f"{principal.name}（{principal.role}）" if principal is not None else ""
+    return renderer(platform, identity)

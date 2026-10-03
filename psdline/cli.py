@@ -39,13 +39,21 @@ def _dump(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def _probe_token(args: argparse.Namespace, platform: Platform) -> str:
+    """探测用的访问令牌：优先命令行 ``--key``，否则取配置里第一个 admin 密钥。"""
+
+    return getattr(args, "key", "") or platform.config.security.first_admin_key()
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     platform = _build(args)
     server = ConsoleServer(platform, host=args.host, port=args.port)
     base_url = server.start()
     payload: dict = {"listening": base_url, "routes": server.api.routes()}
     if args.probe:
-        payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
+        payload["probe"] = probe_endpoints(
+            base_url, list(DEFAULT_PROBE_PATHS), token=_probe_token(args, platform)
+        )
     _dump(payload)
     if args.duration > 0:
         try:
@@ -90,7 +98,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
-    probe = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
+    probe = probe_endpoints(
+        base_url, list(DEFAULT_PROBE_PATHS), token=config.security.first_admin_key()
+    )
     server.stop()
 
     report = {
@@ -188,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", help="JSON 配置文件路径", default=argparse.SUPPRESS)
     common.add_argument("--storage-root", help="覆盖状态存储目录", default=argparse.SUPPRESS)
+    common.add_argument("--key", help="探测接口时使用的访问密钥", default="")
     parser = argparse.ArgumentParser(
         prog="psdline", description="作业顺序与联锁控制服务", parents=[common]
     )

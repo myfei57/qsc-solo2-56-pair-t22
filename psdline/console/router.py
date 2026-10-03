@@ -15,11 +15,12 @@ Handler = Callable[[dict, dict], dict]
 
 @dataclass(frozen=True)
 class Route:
-    """一条已注册的路由。"""
+    """一条已注册的路由；``policy`` 是门控策略（由接口层解释，路由表只负责携带）。"""
 
     method: str
     pattern: str
     handler: Handler
+    policy: object | None = None
 
     def as_dict(self) -> dict:
         return {"method": self.method, "path": self.pattern}
@@ -35,10 +36,12 @@ class Router:
     def __init__(self) -> None:
         self._routes: list[Route] = []
 
-    def add(self, method: str, pattern: str, handler: Handler) -> Route:
+    def add(
+        self, method: str, pattern: str, handler: Handler, policy: object | None = None
+    ) -> Route:
         """注册一条路由。"""
 
-        route = Route(method=method.upper(), pattern=pattern, handler=handler)
+        route = Route(method=method.upper(), pattern=pattern, handler=handler, policy=policy)
         self._routes.append(route)
         return route
 
@@ -47,12 +50,12 @@ class Router:
 
         return list(self._routes)
 
-    def match(self, method: str, path: str) -> tuple[Handler, dict] | None:
-        """匹配一条路由，返回处理器与路径参数。"""
+    def match_route(self, method: str, path: str) -> tuple[Route, dict] | None:
+        """匹配一条路由，返回路由对象与路径参数。"""
 
         method = method.upper()
         segments = _split(path)
-        wildcard: tuple[Handler, dict] | None = None
+        wildcard: tuple[Route, dict] | None = None
         for route in self._routes:
             if route.method != method:
                 continue
@@ -69,7 +72,16 @@ class Router:
                     matched = False
                     break
             if matched:
-                wildcard = (route.handler, params)
+                wildcard = (route, params)
                 if "{" not in route.pattern:
                     return wildcard
         return wildcard
+
+    def match(self, method: str, path: str) -> tuple[Handler, dict] | None:
+        """匹配一条路由，返回处理器与路径参数。"""
+
+        matched = self.match_route(method, path)
+        if matched is None:
+            return None
+        route, params = matched
+        return route.handler, params

@@ -110,6 +110,54 @@ class ConsoleSection:
     port: int = 8080
 
 
+#: 访问主体可担任的角色。
+ROLES: tuple[str, ...] = ("viewer", "operator", "admin")
+
+
+@dataclass(frozen=True)
+class PrincipalSpec:
+    """一个访问主体：名称、角色、静态密钥与站台分区。
+
+    ``partitions`` 里的站台标识限定写动作的作用范围；``"*"`` 表示全域。
+    密钥是每次请求都要携带的静态凭据，部署时必须替换掉默认值。
+    """
+
+    name: str
+    role: str
+    key: str
+    partitions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SecuritySection:
+    """控制台门控与凭据。
+
+    会话凭据挂在会话上、随 ``session_ttl_s`` 失效；危险动作的一次性确认凭据
+    随 ``confirm_ttl_s`` 失效且不可复用。``cross_partition_read`` 放开跨分区
+    的只读查看（写动作始终按分区控制）。关掉它之后，按站台定位的只读接口也
+    按分区核对；汇总类只读接口（状态、列表）仍是线路级，不按分区过滤。
+    """
+
+    session_ttl_s: float = 900.0
+    confirm_ttl_s: float = 30.0
+    cross_partition_read: bool = True
+    principals: tuple[PrincipalSpec, ...] = field(
+        default_factory=lambda: (
+            PrincipalSpec("admin", "admin", "psdline-dev-admin", ("*",)),
+            PrincipalSpec("operator", "operator", "psdline-dev-operator", ("ST1",)),
+            PrincipalSpec("viewer", "viewer", "psdline-dev-viewer", ()),
+        )
+    )
+
+    def first_admin_key(self) -> str:
+        """返回第一个 admin 主体的密钥，供本机自检探测使用。"""
+
+        for spec in self.principals:
+            if spec.role == "admin":
+                return spec.key
+        return ""
+
+
 @dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的控制服务配置。"""
@@ -125,6 +173,7 @@ class PlatformConfig:
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
+    security: SecuritySection = field(default_factory=SecuritySection)
 
     @property
     def name(self) -> str:
@@ -171,7 +220,36 @@ class PlatformConfig:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
+        self._validate_security()
         return self
+
+    def _validate_security(self) -> None:
+        """校验门控配置：有效期、主体唯一性与角色合法性。"""
+
+        security = self.security
+        if security.session_ttl_s <= 0:
+            raise ConfigError("会话有效期必须为正", component="config")
+        if security.confirm_ttl_s <= 0:
+            raise ConfigError("确认凭据有效期必须为正", component="config")
+        if not security.principals:
+            raise ConfigError("至少需要一个访问主体", component="config")
+        names: set[str] = set()
+        keys: set[str] = set()
+        for spec in security.principals:
+            if not spec.name:
+                raise ConfigError("主体名称不能为空", component="config")
+            if spec.name in names:
+                raise ConfigError(f"主体名称重复: {spec.name}", component="config")
+            names.add(spec.name)
+            if spec.role not in ROLES:
+                raise ConfigError(f"未知角色: {spec.role}", component="config")
+            if not spec.key:
+                raise ConfigError(f"主体 {spec.name} 的密钥不能为空", component="config")
+            if spec.key in keys:
+                raise ConfigError("主体密钥不能重复", component="config")
+            keys.add(spec.key)
+        if "admin" not in {spec.role for spec in security.principals}:
+            raise ConfigError("至少需要一个 admin 角色主体", component="config")
 
 
 def default_config() -> PlatformConfig:
@@ -189,7 +267,26 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is SecuritySection and "principals" in kwargs:
+        kwargs["principals"] = tuple(
+            _principal_spec(item) for item in kwargs["principals"]
+        )
     return cls(**kwargs)
+
+
+def _principal_spec(payload: object) -> PrincipalSpec:
+    """从一个字典构造访问主体；非法条目交给装配期校验拦下。"""
+
+    if not isinstance(payload, dict):
+        return PrincipalSpec(name="", role="", key="")
+    known = {"name", "role", "key", "partitions"}
+    kwargs = {key: value for key, value in payload.items() if key in known}
+    kwargs["name"] = str(kwargs.get("name", ""))
+    kwargs["role"] = str(kwargs.get("role", ""))
+    kwargs["key"] = str(kwargs.get("key", ""))
+    partitions = kwargs.get("partitions", ())
+    kwargs["partitions"] = tuple(str(item) for item in partitions) if isinstance(partitions, (list, tuple)) else ()
+    return PrincipalSpec(**kwargs)
 
 
 def config_to_mapping(config: PlatformConfig) -> dict:
@@ -214,6 +311,20 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
+        "security": {
+            "session_ttl_s": config.security.session_ttl_s,
+            "confirm_ttl_s": config.security.confirm_ttl_s,
+            "cross_partition_read": config.security.cross_partition_read,
+            "principals": [
+                {
+                    "name": spec.name,
+                    "role": spec.role,
+                    "key": spec.key,
+                    "partitions": list(spec.partitions),
+                }
+                for spec in config.security.principals
+            ],
+        },
     }
 
 
@@ -234,6 +345,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
+        security=_section(SecuritySection, payload.get("security")),
     )
     return config.validate()
 
