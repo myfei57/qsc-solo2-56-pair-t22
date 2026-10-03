@@ -73,3 +73,41 @@ def test_with_storage_root_replaces_directory():
 def test_console_section_defaults():
     section = ConsoleSection()
     assert (section.host, section.port) == ("127.0.0.1", 8080)
+
+
+def test_auth_section_defaults_and_roundtrip():
+    config = default_config()
+    assert config.auth.enabled is True
+    assert config.auth.session_idle_s <= config.auth.session_absolute_s
+    assert {principal.role for principal in config.auth.principals} == {
+        "viewer",
+        "operator",
+        "dispatcher",
+        "supervisor",
+    }
+    restored = config_from_mapping(config_to_mapping(config))
+    assert restored.auth.principals == config.auth.principals
+
+
+def test_auth_section_rejects_bad_principals():
+    payload = config_to_mapping(default_config())
+    payload["auth"]["principals"][1]["stations"] = []
+    with pytest.raises(ConfigError):
+        config_from_mapping(payload)
+    payload = config_to_mapping(default_config())
+    payload["auth"]["principals"][0]["role"] = "root"
+    with pytest.raises(ConfigError):
+        config_from_mapping(payload)
+    payload = config_to_mapping(default_config())
+    payload["auth"]["ticket_ttl_s"] = 0
+    with pytest.raises(ConfigError):
+        config_from_mapping(payload)
+
+
+def test_auth_section_absent_in_old_config_uses_defaults():
+    """旧版本配置文件没有 auth 段时仍可加载，行为向后兼容。"""
+
+    payload = config_to_mapping(default_config())
+    payload.pop("auth")
+    config = config_from_mapping(payload)
+    assert config.auth.principals == default_config().auth.principals

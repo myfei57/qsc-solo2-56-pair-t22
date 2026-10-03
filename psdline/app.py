@@ -10,6 +10,9 @@
 
 from __future__ import annotations
 
+import functools
+import threading
+
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
@@ -77,6 +80,17 @@ ARRIVAL = "arrival"
 DEPART = "depart"
 
 
+def _serialized(method):
+    """把方法放进平台编排锁：整段动作对并发请求原子可见。"""
+
+    @functools.wraps(method)
+    def guarded(self: "Platform", *args: object, **kwargs: object) -> object:
+        with self._op_lock:
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
 class Platform:
     """站台门区顺序与联锁控制平台。"""
 
@@ -137,6 +151,10 @@ class Platform:
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
+        # 编排锁：到发/开关门等多步动作在并发请求下整段串行，避免两个请求交错
+        # 执行导致"配额扣了、门没开"这类跨组件部分失败。可重入，编排内部互相
+        # 调用不会自锁。
+        self._op_lock = threading.RLock()
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
@@ -319,6 +337,7 @@ class Platform:
             "ready": not missing,
         }
 
+    @_serialized
     def stop(self) -> dict:
         """停运平台：整站清扫后收起全部灯位。"""
 
@@ -346,6 +365,7 @@ class Platform:
 
     # ---- 到发编排 -----------------------------------------------------
 
+    @_serialized
     def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
         """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
 
@@ -422,6 +442,7 @@ class Platform:
         self._persist()
         return {**report, **summary, "arrival_audit": entry.id}
 
+    @_serialized
     def doors_open(self, train_id: str, station_id: str) -> dict:
         """开门并确认车门：对位必须先落盘。"""
 
@@ -443,6 +464,7 @@ class Platform:
         )
         return {**report, "group": group}
 
+    @_serialized
     def depart(self, train_id: str, station_id: str) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
 
@@ -522,6 +544,7 @@ class Platform:
         self._persist()
         return {**report, **summary}
 
+    @_serialized
     def check_gap(self, train_id: str, clear: bool = True) -> dict:
         """确认间隙无异常，或登记一次可疑探测结果。"""
 
@@ -532,6 +555,7 @@ class Platform:
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
 
+    @_serialized
     def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
         """按最新布局重排门区映射，并按新映射联动一次。"""
 
@@ -548,6 +572,7 @@ class Platform:
             "violations": [],
         }
 
+    @_serialized
     def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
         """把一条门控指令排进队列。"""
 
@@ -557,6 +582,7 @@ class Platform:
         )
         return {"ok": True, "train_id": train_id, "command": command.as_dict(), "violations": []}
 
+    @_serialized
     def process_queue(self, train_id: str) -> dict:
         """返回列车队列里待执行的门控指令，并带上发车自检结果。"""
 
@@ -571,6 +597,7 @@ class Platform:
             "violations": list(policy["failures"]),
         }
 
+    @_serialized
     def clear_fault(self, psd_id: str) -> dict:
         """清除门区故障并按条件解锁。"""
 
@@ -582,6 +609,7 @@ class Platform:
         self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
 
+    @_serialized
     def set_fault(self, psd_id: str) -> dict:
         """置位门区故障并锁定。"""
 
@@ -590,6 +618,7 @@ class Platform:
         self.audit.record("interlock_fault", "", gate.station, psd_id=psd_id)
         return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
 
+    @_serialized
     def arm(self, train_id: str, armed: bool) -> dict:
         """启用或退出一列车的联锁。"""
 
@@ -597,6 +626,7 @@ class Platform:
         self.audit.record("interlock_arm", train_id, "", armed=state)
         return {"ok": True, "train_id": train_id, "armed": state, "violations": []}
 
+    @_serialized
     def refresh_position(self, train_id: str, position_m: int) -> dict:
         """按信号刷新列车位置。"""
 
@@ -607,6 +637,7 @@ class Platform:
             self.audit.record("position_rejected", train_id, "", reason=outcome["reason"])
         return {**outcome, "violations": [] if outcome["ok"] else [outcome["reason"]]}
 
+    @_serialized
     def sequence_verdict(self, previous: int, step: int) -> dict:
         """推进门控事件序号并给出回绕判定。"""
 
@@ -622,6 +653,7 @@ class Platform:
         )
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
+    @_serialized
     def batch_open(self, station_id: str) -> dict:
         """按布局里程顺序批量开门。"""
 
@@ -647,17 +679,20 @@ class Platform:
             "violations": [],
         }
 
+    @_serialized
     def sweep(self, station_id: str) -> dict:
         """整站清扫。"""
 
         return sweep_station(self.gates, station_id)
 
+    @_serialized
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
         """登记停站时长。"""
 
         dwell = self.dwells.set(Dwell(train_id=train_id, seconds=seconds, station_id=station_id))
         return {"ok": True, "dwell": dwell.as_dict(), "violations": []}
 
+    @_serialized
     def assign_route(self, train_id: str, origin: str, destination: str, distance_m: int) -> dict:
         """登记运行交路。"""
 
@@ -668,6 +703,7 @@ class Platform:
 
     # ---- 控制循环 -----------------------------------------------------
 
+    @_serialized
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
 

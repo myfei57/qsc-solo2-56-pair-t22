@@ -3,14 +3,52 @@
 每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数透传给平台，
 缺少必填字段或取值非法时返回 ``400``，联锁异常统一转成 ``409`` 并在响应里带上
 组件名与原因。页面不走这里，见 :mod:`psdline.console.pages`。
+
+远程请求（HTTP）在进入业务处理器之前必须先过
+:class:`~psdline.access.guard.Guard`：认证 → 角色 → 分区 → 去重 → 一次性凭据。
+进程内直接调用（命令行、演示、测试夹具）不带 :class:`RequestContext`，按内部
+主体处理，行为与旧版一致，保证现有调用方兼容。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from ..access import (
+    Guard,
+    KeyRegistry,
+    NonceLedger,
+    SessionStore,
+    TicketStore,
+)
+from ..access.errors import AccessError
+from ..access.guard import ReplayAccepted
+from ..access.identity import Principal, system_principal
 from ..app import Platform
 from ..audit import build_timeline
 from ..errors import RailError
 from .router import Router
+
+LOGIN_PATH = "/api/auth/login"
+LOGOUT_PATH = "/api/auth/logout"
+WHOAMI_PATH = "/api/auth/whoami"
+PREPARE_PATH = "/api/auth/prepare"
+
+# 请求信封字段：不参与动作，也不进入一次性票据的请求体指纹。
+_ENVELOPE_KEYS = ("ticket_id", "request_id")
+
+SESSION_COOKIE = "psd_session"
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """一次远程请求携带的凭据与信封信息。"""
+
+    api_key: str = ""
+    session_token: str = ""
+    ticket_id: str = ""
+    request_id: str = ""
+    remote: str = ""
 
 
 def _require(body: dict, key: str) -> str:
@@ -46,11 +84,55 @@ class Api:
     def __init__(self, platform: Platform) -> None:
         self._platform = platform
         self._router = Router()
+        auth = platform.config.auth
+        self.auth_enabled = auth.enabled
+        self._registry = KeyRegistry(auth)
+        self._sessions = SessionStore(
+            platform.clock,
+            idle_s=auth.session_idle_s,
+            absolute_s=auth.session_absolute_s,
+        )
+        self._tickets = TicketStore(platform.clock, ttl_s=auth.ticket_ttl_s)
+        self._nonces = NonceLedger(ttl_s=auth.request_ttl_s)
+        self._guard = Guard(
+            platform.clock,
+            self._registry,
+            self._sessions,
+            self._tickets,
+            self._nonces,
+            audit=self._audit_security,
+            resolve_scope=self._resolve_scope,
+            enabled=auth.enabled,
+        )
         self._register()
 
     @property
     def platform(self) -> Platform:
         return self._platform
+
+    @property
+    def guard(self) -> Guard:
+        return self._guard
+
+    @property
+    def sessions(self) -> SessionStore:
+        return self._sessions
+
+    def _audit_security(self, kind: str, train_id: str, station_id: str, **detail: object) -> None:
+        """安全事件统一落不可变审计流水。"""
+
+        self._platform.audit.record(kind, train_id, station_id, **detail)
+
+    def _resolve_scope(self, kind: str, ident: str) -> str:
+        """把列车/门标识解析成所属站台，用于分区判定。"""
+
+        if kind == "train":
+            train = self._platform.trains.get(ident)
+            return str(train.station) if train is not None and train.station else ""
+        if kind == "gate":
+            gate = self._platform.gates.get(ident)
+            return gate.station if gate is not None else ""
+        return ""
 
     def _register(self) -> None:
         add = self._router.add
@@ -91,29 +173,147 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        add("POST", LOGIN_PATH, self._login)
+        add("POST", LOGOUT_PATH, self._logout)
+        add("GET", WHOAMI_PATH, self._whoami)
+        add("POST", PREPARE_PATH, self._prepare)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
 
         return [route.as_dict() for route in self._router.routes()]
 
+    # ---- 入口 ---------------------------------------------------------
+
     def handle(self, method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
-        """处理一次请求，返回状态码与响应体。"""
+        """进程内入口：按内部主体直接处理，保持旧调用方式兼容。"""
+
+        status, payload, _headers = self.handle_request(method, path, query, body, None)
+        return status, payload
+
+    def handle_request(
+        self,
+        method: str,
+        path: str,
+        query: dict,
+        body: dict,
+        context: RequestContext | None,
+    ) -> tuple[int, dict, dict[str, str]]:
+        """远程入口：完整过一遍门控链，返回状态码、响应体与响应头。"""
+
+        headers: dict[str, str] = {}
+
+        # 登录在认证之前可达；登出认不认得到会话都给成功，避免接口枚举。
+        if path == LOGIN_PATH and method == "POST":
+            return self._do_login(body)
+        if path == LOGOUT_PATH and method == "POST":
+            token = (context.session_token if context else "") or str(body.get("session_token", ""))
+            revoked = self._sessions.revoke(token) if token else False
+            headers["Set-Cookie"] = f"{SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+            return 200, {"ok": True, "revoked": revoked}, headers
+
+        if context is None:
+            principal: Principal = system_principal()
+        else:
+            try:
+                principal = self._guard.authenticate(context.api_key, context.session_token)
+            except AccessError as error:
+                return error.status, error.as_payload(), headers
+
+        if path == WHOAMI_PATH and method == "GET":
+            return 200, {"principal": principal.as_dict()}, headers
+        if path == PREPARE_PATH and method == "POST":
+            try:
+                return self._do_prepare(principal, body)
+            except RailError as error:
+                self._platform.note_error(error)
+                return 400, {"error": type(error).__name__, **error.as_record()}, headers
 
         matched = self._router.match(method, path)
         if matched is None:
-            return 404, {"error": "not_found", "path": path}
-        handler, params = matched
+            return 404, {"error": "not_found", "path": path}, headers
+        handler, params, _pattern = matched
         merged = {**query, **params}
+
+        # 信封字段只用于门控，动作体里剥掉，保证票据指纹两次一致。
+        action_body = {key: value for key, value in body.items() if key not in _ENVELOPE_KEYS}
+        if context is not None and not principal.is_system:
+            try:
+                self._guard.admit(
+                    principal,
+                    method,
+                    path,
+                    merged,
+                    action_body,
+                    ticket_id=context.ticket_id,
+                    request_id=context.request_id,
+                )
+            except ReplayAccepted as accepted:
+                # 同样的 request_id/路径/请求体重放：不重复执行，原样回首次结果。
+                status, payload = accepted.cached
+                return status, payload, headers
+            except AccessError as error:
+                return error.status, error.as_payload(), headers
+
         try:
-            payload = handler(merged, body)
+            payload = handler(merged, action_body)
         except RailError as error:
             self._platform.note_error(error)
             status = 409 if error.component != "console" else 400
-            return status, {"error": type(error).__name__, **error.as_record()}
+            return status, {"error": type(error).__name__, **error.as_record()}, headers
         except (TypeError, ValueError) as error:
-            return 400, {"error": "bad_request", "message": str(error)}
-        return 200, payload
+            return 400, {"error": "bad_request", "message": str(error)}, headers
+
+        if context is not None and not principal.is_system and context.request_id:
+            self._guard.remember(principal, path, action_body, context.request_id, (200, payload))
+        return 200, payload, headers
+
+    # ---- 鉴权动作 -----------------------------------------------------
+
+    def _do_login(self, body: dict) -> tuple[int, dict, dict[str, str]]:
+        api_key = str(body.get("api_key", ""))
+        principal = self._registry.authenticate(api_key) if self.auth_enabled else system_principal()
+        if principal is None:
+            self._audit_security(
+                "security_auth_denied", "", "", reason="login_bad_key", path=LOGIN_PATH
+            )
+            return 401, {"error": "unauthorized", "reason": "凭据无效"}, {}
+        session = self._sessions.issue(principal)
+        self._audit_security(
+            "security_login",
+            "",
+            "",
+            principal=principal.id,
+            role=principal.role,
+            session=session.token[:10] + "…",
+        )
+        cookie = (
+            f"{SESSION_COOKIE}={session.token}; Path=/; HttpOnly; SameSite=Strict"
+        )
+        return (
+            200,
+            {
+                "ok": True,
+                "token": session.token,
+                "expires_at": session.absolute_expiry,
+                "principal": principal.as_dict(),
+            },
+            {"Set-Cookie": cookie},
+        )
+
+    def _do_prepare(self, principal: Principal, body: dict) -> tuple[int, dict, dict[str, str]]:
+        target_path = str(body.get("path", ""))
+        target_body = body.get("body", {})
+        if not target_path:
+            raise RailError("缺少必填字段 'path'", component="console")
+        if not isinstance(target_body, dict):
+            raise RailError("'body' 必须是对象", component="console")
+        target_body = {key: value for key, value in target_body.items() if key not in _ENVELOPE_KEYS}
+        try:
+            ticket = self._guard.prepare_ticket(principal, target_path, {}, target_body)
+        except AccessError as error:
+            return error.status, error.as_payload(), {}
+        return 200, {"ok": True, **ticket}, {}
 
     # ---- 查询 ---------------------------------------------------------
 
@@ -264,3 +464,17 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 鉴权占位处理器（实际在入口处分流，注册仅为路由自洽） ---------
+
+    def _login(self, params: dict, body: dict) -> dict:
+        return {"ok": True}
+
+    def _logout(self, params: dict, body: dict) -> dict:
+        return {"ok": True}
+
+    def _whoami(self, params: dict, body: dict) -> dict:
+        return {"ok": True}
+
+    def _prepare(self, params: dict, body: dict) -> dict:
+        return {"ok": True}

@@ -50,5 +50,19 @@
   "console": {
     "host": "127.0.0.1",
     "port": 8080
+  },
+  "auth": {
+    "enabled": true,
+    "session_idle_s": 900,
+    "session_absolute_s": 43200,
+    "ticket_ttl_s": 60,
+    "request_ttl_s": 300,
+    "principals": [
+      {"id": "view-st1", "name": "一站只看员", "role": "viewer", "stations": ["ST1"], "api_key": "demo-view-st1"},
+      {"id": "op-st1", "name": "一站值班员", "role": "operator", "stations": ["ST1"], "api_key": "demo-op-st1"},
+      {"id": "op-st2", "name": "二站值班员", "role": "operator", "stations": ["ST2"], "api_key": "demo-op-st2"},
+      {"id": "disp", "name": "行车调度", "role": "dispatcher", "stations": [], "api_key": "demo-dispatcher"},
+      {"id": "sup", "name": "控制主管", "role": "supervisor", "stations": [], "api_key": "demo-supervisor"}
+    ]
   }
 }

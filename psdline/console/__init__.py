@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-from .api import Api
-from .pages import PAGE_PATHS, render_page
+from .api import Api, RequestContext
+from .pages import PAGE_PATHS, render_login_page, render_page
 from .router import Route, Router
 from .server import ConsoleServer, probe_endpoints
 
@@ -16,8 +16,10 @@ __all__ = [
     "Api",
     "ConsoleServer",
     "PAGE_PATHS",
+    "RequestContext",
     "Route",
     "Router",
     "probe_endpoints",
+    "render_login_page",
     "render_page",
 ]

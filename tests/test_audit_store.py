@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import threading
+
 from psdline.audit import (
     AuditLog,
     build_timeline,
@@ -68,6 +71,61 @@ def test_audit_timeline_orders_by_time(tmp_path):
     timeline = build_timeline(log.list(), "T01")
     assert [item["kind"] for item in timeline] == ["arrive", "depart"]
     assert timeline[0]["step"] == 1
+
+
+def test_audit_hash_chain_links_and_detects_tamper(tmp_path):
+    log, _bus, clock = _log(tmp_path)
+    first = log.record("arrive", "T01", "ST1")
+    second = log.record("depart", "T01", "ST1")
+    assert first.chain and second.chain
+    assert first.chain != second.chain
+    from psdline.audit.entry import GENESIS, entry_hash
+
+    assert first.chain == entry_hash(GENESIS, first.chain_payload())
+    assert second.chain == entry_hash(first.chain, second.chain_payload())
+    result = log.verify_chain()
+    assert result["ok"] is True and result["checked"] == 2
+
+    # 直接改落盘文件：回放后校验必须报断点
+    segment = log.journal.segments()[0]
+    lines = open(segment, encoding="utf-8").read().splitlines()
+    record = json.loads(lines[0])
+    record["detail"] = {"forged": True}
+    lines[0] = json.dumps(record, ensure_ascii=False)
+    open(segment, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    replayed = log.replay()
+    assert log.verify_chain(replayed)["ok"] is False
+
+
+def test_audit_chain_continues_after_restart(tmp_path):
+    store = JsonStore(str(tmp_path))
+    bus = EventBus()
+    clock = ManualClock()
+    first_log = AuditLog(clock, bus, JsonlJournal(store.root, "audit", segment_limit=8))
+    entry = first_log.record("arrive", "T01", "ST1")
+    # 新实例从落盘恢复，链条接在旧尾部而不是重新起链
+    second_log = AuditLog(clock, EventBus(), JsonlJournal(store.root, "audit", segment_limit=8))
+    continued = second_log.record("depart", "T01", "ST1")
+    from psdline.audit.entry import entry_hash
+
+    assert continued.chain == entry_hash(entry.chain, continued.chain_payload())
+    assert second_log.verify_chain()["ok"] is True
+
+
+def test_audit_concurrent_records_stay_ordered(tmp_path):
+    log, _bus, clock = _log(tmp_path)
+
+    def record_many() -> None:
+        for index in range(50):
+            log.record("concurrent", f"T{index % 3}", "ST1", n=index)
+
+    threads = [threading.Thread(target=record_many) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert log.verify_chain()["ok"] is True
+    assert len(log.list()) == 400
 
 
 def test_json_store_atomic_roundtrip(tmp_path):

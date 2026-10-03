@@ -45,7 +45,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     base_url = server.start()
     payload: dict = {"listening": base_url, "routes": server.api.routes()}
     if args.probe:
-        payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
+        headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+        payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS), headers=headers)
     _dump(payload)
     if args.duration > 0:
         try:
@@ -90,7 +91,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
     base_url = server.start()
-    probe = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
+    # 远程入口必须带凭据：用只读主体的 Key 探测，不会把任何动作再带动一遍。
+    probe = probe_endpoints(
+        base_url,
+        list(DEFAULT_PROBE_PATHS),
+        headers={"Authorization": "Bearer demo-view-st1"},
+    )
     server.stop()
 
     report = {
@@ -198,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--duration", type=float, default=0.0, help="运行多少秒后退出，0 表示常驻")
     serve.add_argument("--probe", action="store_true", help="启动后探测接口")
+    serve.add_argument("--api-key", default="", help="探测时使用的 API Key")
     serve.set_defaults(func=_cmd_serve)
 
     demo = sub.add_parser("demo", help="跑一遍完整流程", parents=[common])

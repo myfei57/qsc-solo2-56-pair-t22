@@ -111,6 +111,34 @@ class ConsoleSection:
 
 
 @dataclass(frozen=True)
+class PrincipalConfig:
+    """一个控制台主体（值班员账号）。"""
+
+    id: str = ""
+    name: str = ""
+    role: str = "viewer"
+    stations: tuple[str, ...] = ()
+    api_key: str = ""
+
+
+@dataclass(frozen=True)
+class AuthSection:
+    """鉴权与一次性凭据参数。
+
+    ``enabled=False`` 时 HTTP 层退化为本地内部主体（仅建议在无网络的标定/演示
+    环境使用）。``principals`` 是预置账号；``api_key`` 可被环境变量
+    ``PSDLINE_KEY_<主体ID大写>`` 覆盖，避免把真实口令写进配置文件。
+    """
+
+    enabled: bool = True
+    session_idle_s: int = 900
+    session_absolute_s: int = 43_200
+    ticket_ttl_s: int = 60
+    request_ttl_s: int = 300
+    principals: tuple[PrincipalConfig, ...] = field(default_factory=lambda: default_principals())
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的控制服务配置。"""
 
@@ -125,6 +153,7 @@ class PlatformConfig:
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
+    auth: AuthSection = field(default_factory=AuthSection)
 
     @property
     def name(self) -> str:
@@ -171,7 +200,40 @@ class PlatformConfig:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
+        if self.auth.session_idle_s <= 0 or self.auth.session_absolute_s <= 0:
+            raise ConfigError("会话有效期必须为正", component="config")
+        if self.auth.session_idle_s > self.auth.session_absolute_s:
+            raise ConfigError("会话空闲有效期不能超过绝对有效期", component="config")
+        if self.auth.ticket_ttl_s <= 0:
+            raise ConfigError("一次性凭据有效期必须为正", component="config")
+        if self.auth.request_ttl_s <= 0:
+            raise ConfigError("请求去重窗口必须为正", component="config")
+        seen_ids: set[str] = set()
+        for principal in self.auth.principals:
+            if not principal.id:
+                raise ConfigError("主体标识不能为空", component="config")
+            if principal.id in seen_ids:
+                raise ConfigError(f"主体标识重复: {principal.id}", component="config")
+            seen_ids.add(principal.id)
+            if principal.role not in ("viewer", "operator", "dispatcher", "supervisor"):
+                raise ConfigError(f"主体 {principal.id} 角色非法: {principal.role}", component="config")
+            if principal.role == "operator" and not principal.stations:
+                raise ConfigError(
+                    f"主体 {principal.id} 必须至少绑定一个站台", component="config"
+                )
         return self
+
+
+def default_principals() -> tuple[PrincipalConfig, ...]:
+    """返回内置演示主体；生产部署应改用环境变量注入各自的 API Key。"""
+
+    return (
+        PrincipalConfig(id="view-st1", name="一站只看员", role="viewer", stations=("ST1",), api_key="demo-view-st1"),
+        PrincipalConfig(id="op-st1", name="一站值班员", role="operator", stations=("ST1",), api_key="demo-op-st1"),
+        PrincipalConfig(id="op-st2", name="二站值班员", role="operator", stations=("ST2",), api_key="demo-op-st2"),
+        PrincipalConfig(id="disp", name="行车调度", role="dispatcher", api_key="demo-dispatcher"),
+        PrincipalConfig(id="sup", name="控制主管", role="supervisor", api_key="demo-supervisor"),
+    )
 
 
 def default_config() -> PlatformConfig:
@@ -189,6 +251,23 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is AuthSection and "principals" in kwargs:
+        raw_principals = kwargs["principals"]
+        items = raw_principals if isinstance(raw_principals, (list, tuple)) else []
+        principals: list[PrincipalConfig] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            principal_kwargs = {
+                key: value
+                for key, value in item.items()
+                if key in PrincipalConfig.__dataclass_fields__
+            }
+            stations = principal_kwargs.get("stations", ())
+            if isinstance(stations, list):
+                principal_kwargs["stations"] = tuple(str(station) for station in stations)
+            principals.append(PrincipalConfig(**principal_kwargs))
+        kwargs["principals"] = tuple(principals)
     return cls(**kwargs)
 
 
@@ -214,6 +293,23 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
+        "auth": {
+            "enabled": config.auth.enabled,
+            "session_idle_s": config.auth.session_idle_s,
+            "session_absolute_s": config.auth.session_absolute_s,
+            "ticket_ttl_s": config.auth.ticket_ttl_s,
+            "request_ttl_s": config.auth.request_ttl_s,
+            "principals": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "role": item.role,
+                    "stations": list(item.stations),
+                    "api_key": item.api_key,
+                }
+                for item in config.auth.principals
+            ],
+        },
     }
 
 
@@ -234,6 +330,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
+        auth=_section(AuthSection, payload.get("auth")),
     )
     return config.validate()
 

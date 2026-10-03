@@ -47,12 +47,12 @@ class Router:
 
         return list(self._routes)
 
-    def match(self, method: str, path: str) -> tuple[Handler, dict] | None:
-        """匹配一条路由，返回处理器与路径参数。"""
+    def match(self, method: str, path: str) -> tuple[Handler, dict, str] | None:
+        """匹配一条路由，返回处理器、路径参数与命中的注册模式。"""
 
         method = method.upper()
         segments = _split(path)
-        wildcard: tuple[Handler, dict] | None = None
+        wildcard: tuple[Handler, dict, str] | None = None
         for route in self._routes:
             if route.method != method:
                 continue
@@ -69,7 +69,7 @@ class Router:
                     matched = False
                     break
             if matched:
-                wildcard = (route.handler, params)
+                wildcard = (route.handler, params, route.pattern)
                 if "{" not in route.pattern:
                     return wildcard
         return wildcard

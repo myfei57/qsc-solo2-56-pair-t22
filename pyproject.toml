@@ -13,6 +13,7 @@ addopts = "-q"
 [tool.setuptools]
 packages = [
     "psdline",
+    "psdline.access",
     "psdline.ns",
     "psdline.store",
     "psdline.station",

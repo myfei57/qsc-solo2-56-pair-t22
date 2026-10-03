@@ -12,11 +12,12 @@ def test_router_prefers_exact_path():
     router = Router()
     router.add("GET", "/api/trains/{trainID}", lambda params, body: {"param": params["trainID"]})
     router.add("GET", "/api/trains/summary", lambda params, body: {"exact": True})
-    handler, params = router.match("GET", "/api/trains/summary")
+    handler, params, pattern = router.match("GET", "/api/trains/summary")
     assert handler({}, {}) == {"exact": True}
     assert params == {}
-    handler, params = router.match("GET", "/api/trains/T01")
+    handler, params, pattern = router.match("GET", "/api/trains/T01")
     assert params == {"trainID": "T01"}
+    assert pattern == "/api/trains/{trainID}"
     assert router.match("GET", "/api/none") is None
     assert router.routes()[0].as_dict()["method"] == "GET"
 
@@ -131,13 +132,18 @@ def test_server_serves_api_and_pages(platform):
     platform.arrive("T01", "ST1", 0)
     server = ConsoleServer(platform, host="127.0.0.1", port=0)
     base_url = server.start()
+    viewer = {"Authorization": "Bearer demo-view-st1"}
     try:
+        blocked = probe_endpoints(base_url, ["/api/status", "/"])
         probe = probe_endpoints(
             base_url,
             ["/api/status", "/api/readiness", "/api/stations", "/", "/trains", "/api/nope"],
+            headers=viewer,
         )
     finally:
         server.stop()
+    assert blocked["/api/status"]["status"] == 401
+    assert blocked["/"]["status"] == 401
     assert probe["/api/status"]["ok"] is True
     assert probe["/api/readiness"]["ok"] is True
     assert probe["/api/stations"]["ok"] is True
